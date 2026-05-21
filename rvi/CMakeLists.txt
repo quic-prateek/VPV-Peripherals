@@ -10,6 +10,7 @@ cmake_minimum_required(VERSION 3.12)
 ###############################################################################
 add_library(${PROJECT_NAME}_rvi
 	aplic.cpp
+    plic.cpp
 )
 if(USE_SC_SIGNAL4IRQ)
     target_compile_definitions(${PROJECT_NAME}_rvi PUBLIC SC_SIGNAL_IF)
