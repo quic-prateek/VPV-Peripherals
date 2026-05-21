@@ -26,9 +26,9 @@
 
 #include "rvi/plic.h"
 
-static constexpr uint32_t NS = 8;
+static constexpr uint32_t NS = 40;
 static constexpr uint32_t NC = 2;
-using Plic = vpvper::rvi::plic<NS, NC>;
+using Plic = vpvper::rvi::plic;
 
 // Register address helpers
 static constexpr uint64_t PRIO(uint32_t s)    { return 0x0000UL + s * 4; }
@@ -42,7 +42,7 @@ struct TestBench : sc_core::sc_module {
 
     sc_core::sc_signal<sc_core::sc_time> clk_sig{"clk"};
     sc_core::sc_signal<bool>             rst_sig{"rst"};
-    Plic                                 dut{"dut"};
+    Plic                                 dut{"dut", NS, NC};
     tlm_utils::simple_initiator_socket<TestBench, 0> isock{"isock"};
 
 #ifdef SC_SIGNAL_IF
@@ -349,6 +349,77 @@ void TestBench::run() {
     write32(CLAIM(0), 1);
     wait(sc_core::SC_ZERO_TIME);
     CHECK(!get_irq(0), "T9: ctx0 de-asserts after completing source 1");
+
+    // -----------------------------------------------------------------------
+    // T10: Source ID in the second pending register word (source ID 33 = index 32)
+    //   Verifies that r_pending[1], r_enabled[ctx][1], and r_priority[33] are
+    //   all correctly addressed when a source > 32 fires.
+    // -----------------------------------------------------------------------
+    write32(PRIO(33),        1);
+    write32(ENABLE(0) + 4,   0x2u);  // bit (33 & 0x1F)=1 → source 33 for ctx0
+    write32(THRESH(0),       0);
+    fire_irq(32, true);               // index 32 → source ID 33
+    CHECK( get_irq(0),   "T10: ctx0 asserts for source 33 (second pending word)");
+    CHECK(!get_irq(1),   "T10: ctx1 stays low (source 33 not enabled for ctx1)");
+
+    const uint32_t c10 = read32(CLAIM(0));
+    CHECK(c10 == 33,                             "T10: claim returns source ID 33");
+    CHECK((read32(PENDING(1)) & 0x2u) == 0,      "T10: bit 1 of PENDING(1) cleared after claim");
+    CHECK(!get_irq(0),                           "T10: ctx0 de-asserts after claim (no further pending)");
+
+    fire_irq(32, false);
+    write32(CLAIM(0), 33);
+    wait(sc_core::SC_ZERO_TIME);
+    CHECK(!get_irq(0), "T10: ctx0 stays de-asserted after complete");
+
+    // Re-fire to confirm the source was properly cleared by complete
+    fire_irq(32, true);
+    CHECK(get_irq(0), "T10: ctx0 re-fires after complete + re-trigger of source 33");
+    fire_irq(32, false);
+    write32(CLAIM(0), read32(CLAIM(0)));  // claim
+    write32(CLAIM(0), 33);               // complete
+    wait(sc_core::SC_ZERO_TIME);
+
+    write32(ENABLE(0) + 4, 0);
+    write32(PRIO(33),       0);
+
+    // -----------------------------------------------------------------------
+    // T11: Priority arbitration across the word boundary
+    //   source 31 (index 30, pending word 0 bit 31, prio 1) and
+    //   source 33 (index 32, pending word 1 bit 1,  prio 2) both pending;
+    //   claim must return 33 first (higher priority), then 31.
+    // -----------------------------------------------------------------------
+    write32(PRIO(31),        1);
+    write32(PRIO(33),        2);
+    write32(ENABLE(0),       0x80000000u);  // bit 31 → source 31 for ctx0
+    write32(ENABLE(0) + 4,   0x2u);         // bit 1  → source 33 for ctx0
+    write32(THRESH(0),       0);
+
+    fire_irq(30, true);   // index 30 → source ID 31
+    fire_irq(32, true);   // index 32 → source ID 33
+    CHECK(get_irq(0), "T11: ctx0 asserts with sources 31 and 33 both pending");
+
+    const uint32_t c11a = read32(CLAIM(0));
+    CHECK(c11a == 33, "T11: claim returns source 33 (higher priority across word boundary)");
+
+    fire_irq(30, false);
+    fire_irq(32, false);
+    write32(CLAIM(0), 33);
+    wait(sc_core::SC_ZERO_TIME);
+    // handle_pending_irq found source 31 still pending during claim of source 33
+    CHECK(get_irq(0), "T11: ctx0 remains asserted for source 31 after completing source 33");
+
+    const uint32_t c11b = read32(CLAIM(0));
+    CHECK(c11b == 31, "T11: claim returns source 31 next");
+
+    write32(CLAIM(0), 31);
+    wait(sc_core::SC_ZERO_TIME);
+    CHECK(!get_irq(0), "T11: ctx0 de-asserts after both sources completed");
+
+    write32(ENABLE(0),     0);
+    write32(ENABLE(0) + 4, 0);
+    write32(PRIO(31),      0);
+    write32(PRIO(33),      0);
 
     sc_core::sc_stop();
 }
